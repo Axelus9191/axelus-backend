@@ -1,7 +1,5 @@
-﻿"""
-============================================
+"""
 CRUD — БИЗНЕС-ЛОГИКА
-============================================
 CRUD = Create, Read, Update, Delete
 
 Здесь вся логика работы с данными:
@@ -10,10 +8,10 @@ CRUD = Create, Read, Update, Delete
 - Подтверждение платежей
 - Активация промокодов
 - Проверка подписок
-
-Каждая функция делает ОДНУ конкретную вещь.
+- Реферальная система
 """
-
+import random
+import string
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from app import models
@@ -27,44 +25,126 @@ from app.config import (
 
 
 # ============================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РЕФЕРАЛОВ
+# ============================================
+
+def generate_referral_reward_code():
+    """Генерирует уникальный промокод для награды вида REF-X7K9M2"""
+    return "REF-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+
+def process_referral_on_register(db: Session, new_device_id: str, referrer_device_id: str | None = None):
+    """
+    Обрабатывает реферальную связь при регистрации.
+    Возвращает кортеж: (новый_пользователь, информация_о_награде_или_None)
+    """
+    # 1. Регистрируем нового пользователя
+    user = register_user(db, new_device_id)
+    
+    reward_info = None
+    
+    # 2. Если есть реферер — обновляем его статистику
+    if referrer_device_id and referrer_device_id != new_device_id:
+        referrer = db.query(models.User).filter(
+            models.User.device_id == referrer_device_id
+        ).first()
+        
+        if referrer:
+            # Привязываем нового пользователя к рефереру
+            user.referred_by = referrer_device_id
+            
+            # Увеличиваем счетчик приглашений у реферера
+            referrer.referral_count += 1
+            
+            # 3. Проверяем условие награды (ровно 10 друзей)
+            if referrer.referral_count == 10:
+                reward_code = generate_referral_reward_code()
+                
+                # Сохраняем награду как специальный промокод в БД
+                # Но пока не активируем его, а просто создаем запись
+                # Чтобы он стал доступен для активации
+                reward_activation = models.PromoActivation(
+                    code=reward_code,
+                    device_id=referrer_device_id, # Привязываем к рефереру
+                    activated_at=datetime.utcnow(), # Помечаем как "выданный", но не "использованный"
+                    is_used=False # ВАЖНО: флаг что код еще не активирован
+                )
+                db.add(reward_activation)
+                
+                reward_info = {
+                    "code": reward_code,
+                    "days": 30,
+                    "description": "Награда за 10 приглашенных друзей"
+                }
+                
+    db.commit()
+    return user, reward_info
+
+
+# ============================================
 # РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
 # ============================================
 
 def register_user(db: Session, device_id: str) -> models.User:
     """
     Регистрирует новое устройство в системе.
-
     Логика:
     1. Проверяем — есть ли уже такой device_id в базе
     2. Если есть — просто возвращаем существующего пользователя
     3. Если нет — создаём нового
-
-    Это безопасно вызывать сколько угодно раз —
-    повторная регистрация не создаст дубликат.
     """
-
-    # Ищем пользователя в базе
     user = db.query(models.User).filter(
         models.User.device_id == device_id
     ).first()
 
-    # Если уже существует — возвращаем его
     if user:
         return user
 
-    # Создаём нового пользователя
     user = models.User(device_id=device_id)
-
-    # Добавляем в базу
     db.add(user)
-
-    # Сохраняем изменения
     db.commit()
-
-    # Обновляем объект (чтобы получить id который база присвоила)
     db.refresh(user)
-
     return user
+
+
+# ============================================
+# ПРОВЕРКА СТАТУСА РЕФЕРАЛОВ (НОВЫЙ ЭНДПОИНТ)
+# ============================================
+
+def get_referral_status(db: Session, device_id: str) -> dict:
+    """
+    Возвращает текущий прогресс реферальной системы.
+    """
+    user = db.query(models.User).filter(
+        models.User.device_id == device_id
+    ).first()
+
+    if not user:
+        return {
+            "device_id": device_id,
+            "referral_count": 0,
+            "target": 10,
+            "progress_percent": 0,
+            "reward_claimed": False,
+            "reward_code": None
+        }
+
+    # Проверяем, была ли уже выдана награда за 10 друзей
+    # Ищем в таблице PromoActivation код, начинающийся с REF- и привязанный к этому устройству
+    reward = db.query(models.PromoActivation).filter(
+        models.PromoActivation.device_id == device_id,
+        models.PromoActivation.code.like("REF-%"),
+        models.PromoActivation.is_used == False
+    ).first()
+
+    return {
+        "device_id": device_id,
+        "referral_count": user.referral_count,
+        "target": 10,
+        "progress_percent": min((user.referral_count / 10) * 100, 100),
+        "reward_claimed": reward is not None,
+        "reward_code": reward.code if reward else None
+    }
 
 
 # ============================================
@@ -74,24 +154,11 @@ def register_user(db: Session, device_id: str) -> models.User:
 def get_subscription_status(db: Session, device_id: str) -> dict:
     """
     Проверяет активна ли подписка у пользователя.
-
-    Логика:
-    1. Находим пользователя по device_id
-    2. Если subscription_until не задан — подписки нет
-    3. Если subscription_until в будущем — подписка активна
-    4. Если subscription_until в прошлом — подписка истекла
-
-    Возвращает словарь с полями:
-    - is_active: True/False
-    - days_left: сколько дней осталось
-    - is_trial: это пробный период или нет
     """
-
     user = db.query(models.User).filter(
         models.User.device_id == device_id
     ).first()
 
-    # Пользователь не найден
     if not user:
         return {
             "is_active": False,
@@ -101,7 +168,6 @@ def get_subscription_status(db: Session, device_id: str) -> dict:
             "expires_at": None
         }
 
-    # Подписка не установлена
     if not user.subscription_until:
         return {
             "is_active": False,
@@ -113,7 +179,6 @@ def get_subscription_status(db: Session, device_id: str) -> dict:
 
     now = datetime.utcnow()
 
-    # Подписка истекла
     if user.subscription_until <= now:
         return {
             "is_active": False,
@@ -123,17 +188,12 @@ def get_subscription_status(db: Session, device_id: str) -> dict:
             "expires_at": user.subscription_until
         }
 
-    # Подписка активна — считаем сколько дней осталось
     delta = user.subscription_until - now
     days_left = delta.days
 
-    # Если осталось больше 50000 дней — это "навсегда"
     if days_left > 50000:
         days_left = 99999
 
-    # Определяем это пробный период или нет
-    # Пробный = подписка активна И trial_used = True
-    # И осталось <= 3 дней
     is_trial = user.trial_used and days_left <= 3
 
     return {
@@ -152,29 +212,15 @@ def get_subscription_status(db: Session, device_id: str) -> dict:
 def activate_trial(db: Session, device_id: str) -> dict:
     """
     Даёт пользователю 3 бесплатных дня.
-
-    Логика:
-    1. Находим пользователя
-    2. Проверяем — использовал ли он уже пробный период
-    3. Если использовал — отказываем
-    4. Если нет — даём 3 дня и помечаем trial_used = True
-
-    Пробный период даётся ОДИН раз на устройство.
-    Нельзя удалить приложение и получить ещё 3 дня —
-    device_id остаётся тем же.
     """
-
-    # Регистрируем (или находим) пользователя
     user = register_user(db, device_id)
 
-    # Уже использовал пробный период
     if user.trial_used:
         return {
             "success": False,
             "message": "Пробный период уже был использован"
         }
 
-    # Даём 3 дня
     now = datetime.utcnow()
     user.subscription_until = now + timedelta(days=3)
     user.trial_used = True
@@ -188,51 +234,29 @@ def activate_trial(db: Session, device_id: str) -> dict:
 
 
 # ============================================
-# СОЗДАНИЕ ПЛАТЕЖА (ГЕНЕРАЦИЯ УНИКАЛЬНОЙ СУММЫ)
+# СОЗДАНИЕ ПЛАТЕЖА
 # ============================================
 
 def create_payment(db: Session, device_id: str, plan: str) -> dict:
     """
     Создаёт платёж с уникальной суммой.
-
-    Логика:
-    1. Проверяем что тариф существует
-    2. Регистрируем пользователя (если ещё не зарегистрирован)
-    3. Отменяем предыдущие неоплаченные платежи этого юзера
-    4. Находим свободную копеечную добавку (01, 02, 03...)
-    5. Создаём платёж со статусом "pending"
-    6. Возвращаем уникальную сумму
-
-    Пример:
-    - Тариф "month" стоит 149 руб
-    - Уже есть pending платежи на 149.01 и 149.02
-    - Значит выдаём 149.03
-    - Юзер переводит ровно 149.03 руб
-    - Админка видит пуш "149.03" и подтверждает
     """
-
-    # Проверяем что тариф существует
     if plan not in PLANS:
         return {"success": False, "message": f"Неизвестный тариф: {plan}"}
 
     plan_info = PLANS[plan]
 
-    # Пробный период нельзя "купить"
     if plan == "trial":
         return {"success": False, "message": "Используйте /activate-trial"}
 
-    # Регистрируем пользователя
     register_user(db, device_id)
 
-    # Отменяем старые pending платежи этого юзера
-    # (чтобы не было путаницы если он передумал и выбрал другой тариф)
     db.query(models.Payment).filter(
         models.Payment.device_id == device_id,
         models.Payment.status == "pending"
     ).update({"status": "expired"})
     db.commit()
 
-    # Помечаем просроченные платежи ВСЕХ юзеров
     now = datetime.utcnow()
     db.query(models.Payment).filter(
         models.Payment.status == "pending",
@@ -240,42 +264,33 @@ def create_payment(db: Session, device_id: str, plan: str) -> dict:
     ).update({"status": "expired"})
     db.commit()
 
-    # Ищем свободную копейку
     base_price = plan_info["base_price"]
 
-    # Получаем все занятые копейки для этой базовой цены
     active_payments = db.query(models.Payment).filter(
         models.Payment.base_amount == base_price,
         models.Payment.status == "pending"
     ).all()
 
-    # Собираем множество занятых копеек
     used_kopecks = set()
     for p in active_payments:
-        # Вытаскиваем копейки: 149.03 → 3
         kopeck = round((p.unique_amount - base_price) * 100)
         used_kopecks.add(kopeck)
 
-    # Находим первую свободную копейку
     unique_kopeck = None
     for k in range(1, MAX_PENDING_PAYMENTS + 1):
         if k not in used_kopecks:
             unique_kopeck = k
             break
 
-    # Все слоты заняты (99 человек одновременно платят)
     if unique_kopeck is None:
         return {
             "success": False,
             "message": "Слишком много платежей. Попробуйте через 5 минут."
         }
 
-    # Формируем уникальную сумму
     unique_amount = base_price + unique_kopeck / 100.0
-    # Округляем чтобы не было 149.0000000001
     unique_amount = round(unique_amount, 2)
 
-    # Создаём платёж
     payment = models.Payment(
         device_id=device_id,
         plan=plan,
@@ -302,41 +317,24 @@ def create_payment(db: Session, device_id: str, plan: str) -> dict:
 
 
 # ============================================
-# ПОДТВЕРЖДЕНИЕ ПЛАТЕЖА (ОТ АДМИНКИ)
+# ПОДТВЕРЖДЕНИЕ ПЛАТЕЖА
 # ============================================
 
 def confirm_payment(db: Session, amount: float, admin_key: str) -> dict:
     """
-    Подтверждает платёж по сумме.
-    Вызывается админкой когда она видит пуш от Сбера.
-
-    Логика:
-    1. Проверяем админский ключ
-    2. Ищем pending платёж с такой суммой
-    3. Если нашли — активируем подписку
-    4. Если не нашли — возвращаем ошибку
-
-    Безопасность:
-    - Без правильного admin_key подтвердить нельзя
-    - Подтвердить можно только pending платёж
-    - Просроченные платежи не подтверждаются
+    Подтверждает платёж по сумме от админки.
     """
-
-    # Проверяем админский ключ
     if admin_key != ADMIN_SECRET_KEY:
         return {"success": False, "message": "Неверный ключ администратора"}
 
     now = datetime.utcnow()
 
-    # Сначала помечаем просроченные
     db.query(models.Payment).filter(
         models.Payment.status == "pending",
         models.Payment.expires_at < now
     ).update({"status": "expired"})
     db.commit()
 
-    # Ищем pending платёж с такой суммой
-    # Округляем до 2 знаков для точного сравнения
     amount = round(amount, 2)
 
     payment = db.query(models.Payment).filter(
@@ -350,18 +348,14 @@ def confirm_payment(db: Session, amount: float, admin_key: str) -> dict:
             "message": f"Платёж на сумму {amount} не найден или просрочен"
         }
 
-    # Нашли платёж! Подтверждаем его
     payment.status = "confirmed"
     payment.confirmed_at = now
 
-    # Активируем подписку пользователю
     user = db.query(models.User).filter(
         models.User.device_id == payment.device_id
     ).first()
 
     if user:
-        # Если подписка уже есть — продлеваем от текущей даты окончания
-        # Если подписки нет — начинаем от сейчас
         if user.subscription_until and user.subscription_until > now:
             start_date = user.subscription_until
         else:
@@ -390,20 +384,15 @@ def confirm_payment(db: Session, amount: float, admin_key: str) -> dict:
 def get_payment_status(db: Session, device_id: str) -> dict:
     """
     Проверяет статус последнего платежа пользователя.
-    Клиент вызывает это каждые 5 секунд после создания платежа,
-    чтобы узнать — подтвердили его или нет.
     """
-
     now = datetime.utcnow()
 
-    # Помечаем просроченные
     db.query(models.Payment).filter(
         models.Payment.status == "pending",
         models.Payment.expires_at < now
     ).update({"status": "expired"})
     db.commit()
 
-    # Берём последний платёж пользователя
     payment = db.query(models.Payment).filter(
         models.Payment.device_id == device_id
     ).order_by(models.Payment.created_at.desc()).first()
@@ -429,41 +418,47 @@ def get_payment_status(db: Session, device_id: str) -> dict:
 def activate_promo(db: Session, device_id: str, code: str) -> dict:
     """
     Активирует промокод.
-
-    Логика:
-    1. Приводим код к верхнему регистру (axelus-owner-001 → AXELUS-OWNER-001)
-    2. Проверяем что такой промокод существует в config.py
-    3. Проверяем что он ещё не был использован
-    4. Если всё ок — активируем подписку и записываем использование
-
-    Каждый промокод можно использовать ТОЛЬКО ОДИН РАЗ.
+    Поддерживает как статические коды из config.py,
+    так и динамические реферальные награды из БД.
     """
-
-    # Приводим к верхнему регистру
     code = code.strip().upper()
 
-    # Проверяем существование промокода
-    if code not in PROMO_CODES:
-        return {"success": False, "message": "Промокод не найден"}
-
-    # Проверяем — не использован ли уже
-    existing = db.query(models.PromoActivation).filter(
-        models.PromoActivation.code == code
+    # 1. Сначала проверяем динамические реферальные награды в БД
+    # Ищем запись где код совпадает, device_id совпадает, и is_used=False
+    reward_activation = db.query(models.PromoActivation).filter(
+        models.PromoActivation.code == code,
+        models.PromoActivation.device_id == device_id,
+        models.PromoActivation.is_used == False
     ).first()
 
-    if existing:
-        return {"success": False, "message": "Этот промокод уже использован"}
+    promo_info = None
+    
+    if reward_activation:
+        # Это реферальная награда
+        promo_info = {
+            "days": 30,
+            "description": "Награда за 10 приглашенных друзей"
+        }
+    elif code in PROMO_CODES:
+        # Это статический код из конфига
+        promo_info = PROMO_CODES[code]
+    else:
+        return {"success": False, "message": "Промокод не найден"}
 
-    # Регистрируем пользователя
+    # 2. Для обычных промокодов проверяем, не использован ли он кем-то вообще
+    if not code.startswith("REF-"):
+        existing_standard = db.query(models.PromoActivation).filter(
+            models.PromoActivation.code == code
+        ).first()
+
+        if existing_standard:
+            return {"success": False, "message": "Этот промокод уже использован"}
+
+    # 3. Активируем подписку
     user = register_user(db, device_id)
-
-    # Получаем данные промокода
-    promo_info = PROMO_CODES[code]
     days = promo_info["days"]
 
-    # Активируем подписку
     now = datetime.utcnow()
-
     if user.subscription_until and user.subscription_until > now:
         start_date = user.subscription_until
     else:
@@ -471,12 +466,18 @@ def activate_promo(db: Session, device_id: str, code: str) -> dict:
 
     user.subscription_until = start_date + timedelta(days=days)
 
-    # Записываем что промокод использован
-    activation = models.PromoActivation(
-        code=code,
-        device_id=device_id
-    )
-    db.add(activation)
+    # 4. Обновляем запись о промокоде
+    if reward_activation:
+        # Для реферальной награды просто помечаем как использованную
+        reward_activation.is_used = True
+    else:
+        # Для обычного промокода создаем новую запись
+        activation = models.PromoActivation(
+            code=code,
+            device_id=device_id,
+            is_used=True
+        )
+        db.add(activation)
 
     db.commit()
 
