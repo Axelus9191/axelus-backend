@@ -1,17 +1,10 @@
-﻿"""
-============================================
-МОДЕЛИ БАЗЫ ДАННЫХ
-============================================
+"""
+МОДЕЛИ БАЗЫ ДАННЫХ (ФИНАЛЬНАЯ ВЕРСИЯ С РЕФЕРАЛКОЙ)
 Каждый класс здесь = одна таблица в базе данных.
 SQLAlchemy автоматически создаст эти таблицы
 при первом запуске сервера.
-
-У нас 3 таблицы:
-1. users — все пользователи (устройства)
-2. payments — все платежи
-3. promo_activations — использованные промокоды
+Если таблицы уже есть — добавятся только новые колонки.
 """
-
 from datetime import datetime
 from sqlalchemy import (
     Column,
@@ -33,13 +26,11 @@ class User(Base):
     Мы идентифицируем пользователя по device_id —
     это уникальный ID который генерируется на телефоне
     при первом запуске приложения.
-
-    Пример записи:
-    | id | device_id    | created_at          | sub_until           | trial_used |
-    | 1  | abc123def456 | 2024-01-15 10:30:00 | 2024-02-15 10:30:00 | True       |
+    
+    Добавлены поля для реферальной системы:
+    - referral_count: сколько друзей уже привел
+    - referred_by: device_id друга, который пригласил
     """
-
-    # Имя таблицы в базе данных
     __tablename__ = "users"
 
     # Уникальный числовой ID (автоматически увеличивается)
@@ -63,6 +54,15 @@ class User(Base):
     # Пробный период даётся ОДИН раз на устройство
     trial_used = Column(Boolean, default=False)
 
+    # === НОВЫЕ ПОЛЯ ДЛЯ РЕФЕРАЛЬНОЙ СИСТЕМЫ ===
+    # Сколько друзей этот пользователь уже пригласил
+    referral_count = Column(Integer, default=0, nullable=False)
+    
+    # Device ID того, кто пригласил этого пользователя
+    # Если None — пришел сам или по прямой ссылке без ref
+    referred_by = Column(String, nullable=True, index=True) 
+    # ==========================================
+
 
 class Payment(Base):
     """
@@ -76,12 +76,7 @@ class Payment(Base):
     - pending   = ждём оплату
     - confirmed = оплата подтверждена админкой
     - expired   = время ожидания вышло (20 минут)
-
-    Пример записи:
-    | id | device_id    | plan   | base_amount | unique_amount | status    |
-    | 1  | abc123def456 | month  | 149         | 149.03        | confirmed |
     """
-
     __tablename__ = "payments"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -123,12 +118,11 @@ class PromoActivation(Base):
     Когда кто-то вводит промокод, создаётся запись.
     Это нужно чтобы один промокод нельзя было
     использовать дважды.
-
-    Пример записи:
-    | id | code              | device_id    | activated_at        |
-    | 1  | AXELUS-OWNER-001  | abc123def456 | 2024-01-15 10:30:00 |
+    
+    Для реферальных наград используется поле is_used:
+    - False: награда выдана, но ещё не активирована
+    - True: награда активирована и больше недоступна
     """
-
     __tablename__ = "promo_activations"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -136,8 +130,13 @@ class PromoActivation(Base):
     # Какой промокод был использован
     code = Column(String, unique=True, index=True, nullable=False)
 
-    # Кто его использовал
+    # Кто его использовал (или кому выдана награда)
     device_id = Column(String, nullable=False)
 
-    # Когда активирован
+    # Когда создана запись (выдана или активирована)
     activated_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Флаг использования для реферальных наград
+    # Обычные промокоды всегда True (создаются при активации)
+    # Реферальные коды сначала False (при выдаче), потом True (при активации)
+    is_used = Column(Boolean, default=True, nullable=False)
